@@ -30,7 +30,6 @@ service-account*.json
 credentials*.json
 google-services.json
 GoogleService-Info.plist
-
 # 依存関係とビルドの成果物
 node_modules/
 dist/
@@ -39,7 +38,6 @@ out/
 .next/
 .wrangler/
 venv/
-
 # OS とエディタ
 Thumbs.db
 .idea/
