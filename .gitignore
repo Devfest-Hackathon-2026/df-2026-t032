@@ -1,7 +1,25 @@
-# 秘密情報（コミットしない）
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
 .env
 .env.*
 !.env.example
+*.dev.vars
+# 評価用データはライセンスの都合で入れない（README を参照）
+data/
+*.xlsx
+.DS_Store
+.claude/
+# エミュレータのログ
+*-debug.log
+# 生成した動画は Git で管理しない
+demo/
+# 指示文の自動改善の記録（python -m rsi run）
+rsi_runs/
+
+# 提出用リポジトリの既定（運営の .gitignore）
+# 秘密情報（コミットしない）
 .dev.vars
 .dev.vars.*
 !.dev.vars.example
@@ -20,13 +38,9 @@ build/
 out/
 .next/
 .wrangler/
-__pycache__/
-*.pyc
-.venv/
 venv/
 
 # OS とエディタ
-.DS_Store
 Thumbs.db
 .idea/
 .vscode/*
