@@ -1,6 +1,9 @@
 """APIの通し試験。実行環境は手元の合成コードだけを動かす。"""
 import io
 import zipfile
+from unittest.mock import Mock
+
+import pytest
 
 import pytest
 from fastapi.testclient import TestClient
@@ -191,6 +194,50 @@ def test_other_teacher_cannot_read_assignment(client):
     assert client.post(f"/v1/assignments/{assignment}:close", headers=other).status_code == 404
 
 
+@pytest.mark.parametrize("operation", ["upload", "followups", "action", "export"])
+@pytest.mark.parametrize("other_teacher", [False, True])
+def test_teacher_request_reads_the_class_once(client, store, monkeypatch, operation, other_teacher):
+    created = client.post("/v1/classes", json={"name": "x", "student_numbers": ["1"]}, headers=TEACHER).json()
+    assignment = client.post("/v1/assignments", json={"class_id": created["class_id"], "title": "x"}, headers=TEACHER).json()["assignment_id"]
+    student_id = next(iter(store.get_class(created["class_id"]).student_numbers))
+    read = Mock(wraps=store.get_class)
+    monkeypatch.setattr(store, "get_class", read)
+    url = f"/v1/assignments/{assignment}"
+    headers = {"X-Dev-Teacher": "teacher-b"} if other_teacher else TEACHER
+    if operation == "upload":
+        response = client.post(f"{url}/submissions", files={"file": ("s.zip", make_zip({"1.py": CODE}), "application/zip")}, headers=headers)
+    elif operation == "action":
+        response = client.post(f"{url}/followups/{student_id}", json={"action": "ask_in_class"}, headers=headers)
+    else:
+        response = client.get(f"{url}/{operation}", headers=headers)
+    read.assert_called_once_with(created["class_id"])
+    if other_teacher:
+        assert response.status_code == 404
+        assert store.submissions(assignment) == {} and store.followups(assignment) == {}
+    else:
+        assert response.status_code == 200
+        if operation == "upload":
+            assert response.json() == {"accepted": 1, "problems": []}
+        elif operation == "action":
+            assert response.json() == {"saved": True}
+
+
+def test_class_ownership_is_checked_again_on_the_next_request(client, store, monkeypatch):
+    created = client.post("/v1/classes", json={"name": "x", "student_numbers": ["1"]}, headers=TEACHER).json()
+    assignment = client.post("/v1/assignments", json={"class_id": created["class_id"], "title": "x"}, headers=TEACHER).json()["assignment_id"]
+    original = store.get_class
+    owner = ["teacher-a"]
+    def read(class_id):
+        classroom = original(class_id)
+        classroom.teacher = owner[0]
+        return classroom
+    monkeypatch.setattr(store, "get_class", read)
+    url = f"/v1/assignments/{assignment}/followups"
+    assert client.get(url, headers=TEACHER).status_code == 200
+    owner[0] = "teacher-b"
+    assert client.get(url, headers=TEACHER).status_code == 404
+
+
 def test_student_token_cannot_reach_another_class(client):
     created, _ = setup_open(client)
     other_created = client.post("/v1/classes", json={"name": "1-B", "student_numbers": ["9"]}, headers=TEACHER).json()
@@ -204,7 +251,9 @@ def test_student_token_cannot_reach_another_class(client):
 def test_tampered_token_is_rejected(client):
     created, assignment = setup_open(client)
     headers, _ = login(client, created)
-    tampered = {"Authorization": headers["Authorization"][:-2] + "00"}
+    original = headers["Authorization"]
+    replacement = "0" if original[-1] != "0" else "1"
+    tampered = {"Authorization": original[:-1] + replacement}
     assert client.post(f"/v1/assignments/{assignment}/attempt:start", headers=tampered).status_code == 401
 
 
@@ -544,6 +593,87 @@ def test_students_explain_missed_lines_in_their_own_words(client):
     assert client.post(url, json={"line": missed[0], "text": "x"}).status_code == 401
     row = close_and_view(client, assignment)["order"][0]
     assert row["explanations"] == {str(missed[0]): "n が 2 より大きいときだけ足す"}
+
+
+def explain_missed_line(client, created, assignment) -> tuple[dict, str, int]:
+    headers, _ = login(client, created)
+    client.post(f"/v1/assignments/{assignment}/attempt:start", headers=headers)
+    result = client.post(f"/v1/assignments/{assignment}/attempt:submit", json={"answers": {}}, headers=headers).json()
+    line = min(item["line"] for item in result["results"] if not item["correct"] and item["line"])
+    return headers, f"/v1/assignments/{assignment}/attempt:explain", line
+
+
+def test_explanation_sentences_are_checked_by_running_the_students_code(client):
+    """説明の文を本人のコードで動かして確かめ、教員の画面に添える。説明どおりかは実行の結果で決める。"""
+    created, assignment = setup_open(client, numbers=("1",))
+    headers, url, line = explain_missed_line(client, created, assignment)
+    # CODE は 16 だけを表示する。何を試すかは、Gemini を使わない既定の規則（PatternProbePlanner）が決める
+    text = "大きい数だけ足している。16も表示される。3も表示される"
+    assert client.post(url, json={"line": line, "text": text}, headers=headers).status_code == 200
+    row = close_and_view(client, assignment)["order"][0]
+    assert row["explanations"] == {str(line): text}
+    checks = row["explanation_checks"][str(line)]
+    assert [(c["sentence"], c["verdict"]) for c in checks] == [("16も表示される。", "holds"), ("3も表示される", "fails")]
+    assert checks[1]["runs"] == [
+        {"tried": "実行", "expected": "「3」の行が表示される", "actual": "「3」の行は表示されなかった", "verdict": "fails"}
+    ]
+
+
+def test_rewritten_explanation_drops_the_old_checks(client):
+    created, assignment = setup_open(client, numbers=("1",))
+    headers, url, line = explain_missed_line(client, created, assignment)
+    client.post(url, json={"line": line, "text": "3も表示される"}, headers=headers)
+    client.post(url, json={"line": line, "text": "合計を出している"}, headers=headers)  # 確かめられる文がない
+    row = close_and_view(client, assignment)["order"][0]
+    assert row["explanations"] == {str(line): "合計を出している"} and row["explanation_checks"] == {}
+
+
+def test_sending_the_same_explanation_again_does_not_plan_again(monkeypatch, store):
+    """同じ文をもう一度送っても、Gemini（ここでは数える偽物）と隔離環境を使い直さない。"""
+    from qgen.probes import PatternProbePlanner
+
+    monkeypatch.setenv("APP_ENV", "local")
+    monkeypatch.setenv("ALLOW_LOCAL_SANDBOX", "1")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 32)
+    asked = []
+
+    class Counting(PatternProbePlanner):
+        def plan(self, claim, code):
+            asked.append(claim)
+            return super().plan(claim, code)
+
+    app_client = TestClient(create_app(store, LocalDevSandbox, TemplateAI, Counting))
+    created, assignment = setup_open(app_client, numbers=("1",))
+    headers, url, line = explain_missed_line(app_client, created, assignment)
+    for _ in range(2):
+        assert app_client.post(url, json={"line": line, "text": "16も表示される"}, headers=headers).status_code == 200
+    assert asked == ["16も表示される"]
+
+
+def test_explanation_checks_stop_after_the_limit(monkeypatch, store):
+    """書き直して何度も送られても、確かめる（Gemini と隔離環境を使う）のは決めた回数まで。説明そのものは保存する。"""
+    from qgen.probes import PatternProbePlanner
+
+    monkeypatch.setenv("APP_ENV", "local")
+    monkeypatch.setenv("ALLOW_LOCAL_SANDBOX", "1")
+    monkeypatch.setenv("SESSION_SECRET", "x" * 32)
+    monkeypatch.setattr(service, "EXPLANATION_CHECK_LIMIT", 2)
+    asked = []
+
+    class Counting(PatternProbePlanner):
+        def plan(self, claim, code):
+            asked.append(claim)
+            return super().plan(claim, code)
+
+    app_client = TestClient(create_app(store, LocalDevSandbox, TemplateAI, Counting))
+    created, assignment = setup_open(app_client, numbers=("1",))
+    headers, url, line = explain_missed_line(app_client, created, assignment)
+    for text in ("16も表示される", "16も表示される", "3も表示される", "5も表示される"):
+        assert app_client.post(url, json={"line": line, "text": text}, headers=headers).status_code == 200
+    # 同じ文の送り直しは数えない。3つ目の違う文からは確かめない
+    assert asked == ["16も表示される", "3も表示される"]
+    row = close_and_view(app_client, assignment)["order"][0]
+    assert row["explanations"] == {str(line): "5も表示される"} and row["explanation_checks"] == {}
 
 
 def test_demo_seed_brings_past_records(client, monkeypatch):

@@ -1,6 +1,6 @@
-"""データの置き場所。手元ではメモリ、本番では Firestore を使う。
+"""データの置き場所。手元ではメモリ、本番では Firestore、校内LAN版では教員PCの暗号化したファイル（app/lan_store.py）を使う。
 
-どちらも同じ操作を持つ。受け取る値と返す値はコピーなので、書き込みの呼び忘れは手元のテストでも見つかる。
+どれも同じ操作を持つ。受け取る値と返す値はコピーなので、書き込みの呼び忘れは手元のテストでも見つかる。
 """
 import copy
 import os
@@ -137,8 +137,14 @@ class Store(Protocol):
     def use_chat_turn(self, assignment_id: str, student_id: str, limit: int) -> int | None:
         """振り返りの質問を1回分使う。残りの回数を返し、使い切っていれば None を返す。"""
 
+    def use_explanation_check(self, assignment_id: str, student_id: str, limit: int) -> int | None:
+        """生徒の説明を本人のコードで動かして確かめる処理を1回分使う。残りの回数を返し、使い切っていれば None を返す。"""
+
     def save_explanation(self, assignment_id: str, student_id: str, line: int, text: str) -> bool:
         """生徒が自分の言葉で書いた、行の説明を残す。解答を送る前なら何もせず False を返す。"""
+
+    def save_explanation_checks(self, assignment_id: str, student_id: str, line: int, text: str, checks: list[Doc]) -> None:
+        """説明を本人のコードで動かして確かめた結果を残す。説明がその後に text から書き直されていれば何もしない。"""
 
     def followups(self, assignment_id: str) -> dict[str, Doc]: ...
 
@@ -336,14 +342,21 @@ class MemoryStore:
         with self._lock:
             return copy.deepcopy(self._attempts[assignment_id])
 
-    def use_chat_turn(self, assignment_id: str, student_id: str, limit: int) -> int | None:
+    def _use_turn(self, assignment_id: str, student_id: str, field: str, limit: int) -> int | None:
+        """解答に付けた回数 field を1つ進める。解答がなければ使えない。"""
         with self._lock:
             attempt = self._attempts[assignment_id].get(student_id)
-            used = attempt.get("chat_used", 0) if attempt else limit
+            used = attempt.get(field, 0) if attempt else limit
             if used >= limit:
                 return None
-            attempt["chat_used"] = used + 1
+            attempt[field] = used + 1
             return limit - used - 1
+
+    def use_chat_turn(self, assignment_id: str, student_id: str, limit: int) -> int | None:
+        return self._use_turn(assignment_id, student_id, "chat_used", limit)
+
+    def use_explanation_check(self, assignment_id: str, student_id: str, limit: int) -> int | None:
+        return self._use_turn(assignment_id, student_id, "explanation_checks_used", limit)
 
     def save_explanation(self, assignment_id: str, student_id: str, line: int, text: str) -> bool:
         with self._lock:
@@ -352,6 +365,13 @@ class MemoryStore:
                 return False
             attempt.setdefault("explanations", {})[str(line)] = text
             return True
+
+    def save_explanation_checks(self, assignment_id: str, student_id: str, line: int, text: str, checks: list[Doc]) -> None:
+        with self._lock:
+            attempt = self._attempts[assignment_id].get(student_id)
+            if attempt is None or (attempt.get("explanations") or {}).get(str(line)) != text:
+                return
+            attempt.setdefault("explanation_checks", {})[str(line)] = {"text": text, "checks": copy.deepcopy(checks)}
 
     def followups(self, assignment_id: str) -> dict[str, Doc]:
         with self._lock:
@@ -410,7 +430,7 @@ class MemoryStore:
             return self._usage.get(key, 0)
 
     def add_usage(self, key: str, expire_at: float) -> None:
-        # 手元では再起動で消えるので、expire_at は使わない
+        # 日が替わればキーが変わるので、expire_at は使わない（メモリ版は再起動で消え、校内LAN版はファイルに残る）
         with self._lock:
             self._usage[key] = self._usage.get(key, 0) + 1
 
