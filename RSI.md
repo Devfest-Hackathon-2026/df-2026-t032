@@ -5,7 +5,7 @@
 ムシトリのRSIは、**生徒の説明を確かめる実行テストをGeminiに考えさせる指示文を、評価結果から繰り返し改善する仕組み**です。現在の対象は `probe_planner` の1段階です。モデルの重みを再学習する処理ではなく、指示文の候補を作って比較する開発用の改善ループです。
 
 > [!NOTE]
-> RSI と、改善した指示文を使う `probe_planner`（[`apps/api/qgen/probes.py`](./apps/api/qgen/probes.py)）は、今は評価ハーネスの中で検証している段階です。授業の流れ（公開 URL の教員と生徒の画面）にはまだ組み込んでいません。
+> 改善ループ（[`apps/api/rsi/`](./apps/api/rsi)）は開発用で、授業中に自動では回りません。採用した指示文（`probe_planner` の v003、[`apps/api/qgen/prompts/probe_planner/`](./apps/api/qgen/prompts/probe_planner)）は、公開 URL の「生徒が送った説明を本人のコードで動かして確かめる」機能で使っています（[`apps/api/app/service.py`](./apps/api/app/service.py) の `check_explanation`）。下の成績は評価ハーネスの中で測ったものです。
 
 ## 何を改善している？
 
